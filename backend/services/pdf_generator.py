@@ -1,0 +1,863 @@
+"""
+PDF Generator — Protokół zwrotu pojazdu
+========================================
+Generates a vehicle return protocol matching the Zaufaj Rzeczoznawcy client template.
+Uses DejaVu Sans font for full Polish character support (ł, ś, ż, ą, ę, ó, ń, ć, ź).
+
+4-page layout:
+  Page 1: Title, order number, Dane Oględzin, Dane Pojazdu, Wyposażenie (start)
+  Page 2: Wyposażenie (continued) — auto page break handled by reportlab
+  Page 3: Nadwozie, Wnętrze, Opony, Signatures
+  Page 4: Dokumentacja Zdjęciowa (only if photos exist)
+"""
+
+import io
+import os
+import re
+import base64
+import logging
+import requests as http_requests
+from datetime import datetime
+from typing import Optional
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm, mm
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    PageBreak, Image
+)
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+logger = logging.getLogger("services.pdf_generator")
+
+# ─── Font Registration ───────────────────────────────────────
+FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
+
+_fonts_registered = False
+
+def _register_fonts():
+    global _fonts_registered
+    if _fonts_registered:
+        return
+    try:
+        pdfmetrics.registerFont(TTFont('DejaVu', FONT_PATHS[0]))
+        pdfmetrics.registerFont(TTFont('DejaVu-Bold', FONT_PATHS[1]))
+        _fonts_registered = True
+        logger.info("✓ DejaVu Sans fonts registered for Polish character support")
+    except Exception as e:
+        logger.warning(f"DejaVu fonts not found ({e}). Using Helvetica fallback.")
+
+def _fn():
+    """Return (regular, bold) font names."""
+    _register_fonts()
+    if _fonts_registered:
+        return 'DejaVu', 'DejaVu-Bold'
+    return 'Helvetica', 'Helvetica-Bold'
+
+
+# ─── Color Palette ────────────────────────────────────────────
+BLACK      = colors.black
+WHITE      = colors.white
+LIGHT_GREY = colors.HexColor("#F5F5F5")
+MID_GREY   = colors.HexColor("#CCCCCC")
+HEADER_BG  = colors.HexColor("#1A1A1A")
+
+PAGE_W, PAGE_H = A4
+MARGIN = 1.5 * cm
+CONTENT_W = PAGE_W - 2 * MARGIN
+
+
+# ─── Style Helpers ────────────────────────────────────────────
+def _style(name, **kw):
+    fn, fnb = _fn()
+    d = dict(fontName=fn, fontSize=8, leading=10, textColor=BLACK)
+    d.update(kw)
+    return ParagraphStyle(name, **d)
+
+
+def p(t, s=None):
+    """Wrap text in a Paragraph."""
+    fn, fnb = _fn()
+    if s is None:
+        s = _style("_cn")
+    return Paragraph(str(t) if t is not None else "", s)
+
+
+def pb(t):
+    """Bold paragraph."""
+    fn, fnb = _fn()
+    return p(t, _style("_cb", fontName=fnb))
+
+
+def pc(t, bold=False):
+    """Centered paragraph."""
+    fn, fnb = _fn()
+    return p(t, _style("_xc", fontName=fnb if bold else fn, alignment=TA_CENTER))
+
+
+def sp(h=0.25):
+    return Spacer(1, h * cm)
+
+
+# ─── Data Extraction Helpers ─────────────────────────────────
+def val(d, *keys, default=""):
+    """Extract first non-empty value from dict using multiple key attempts."""
+    for k in keys:
+        v = d.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return default
+
+
+def fmt_date(raw):
+    """Format a date string to DD-MM-YYYY."""
+    if not raw:
+        return ""
+    for f in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(str(raw)[:19], f).strftime("%d-%m-%Y")
+        except Exception:
+            pass
+    return str(raw)[:10]
+
+
+# ─── Base Table Style ─────────────────────────────────────────
+def _grid_ts():
+    fn, fnb = _fn()
+    return TableStyle([
+        ("GRID",          (0, 0), (-1, -1), 0.5, MID_GREY),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("FONTNAME",      (0, 0), (-1, -1), fn),
+        ("FONTSIZE",      (0, 0), (-1, -1), 7),
+    ])
+
+
+def section_header(title, w):
+    """Black background section header with white text."""
+    fn, fnb = _fn()
+    t = Table(
+        [[p(title, _style("_sh", fontName=fnb, fontSize=10, leading=13, textColor=WHITE))]],
+        colWidths=[w],
+    )
+    t.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), HEADER_BG),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+        ("TOPPADDING",    (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    return t
+
+
+# ─── Image Loader ─────────────────────────────────────────────
+def load_image_from_source(src: str, timeout=10) -> bytes:
+    """Load raw image bytes from a base64 data URI or HTTP URL.
+
+    `timeout` is the httpx timeout for the fetch (float seconds OR an
+    httpx.Timeout object). Default 10s preserves the long-standing
+    behavior used by the wycena / inspection PDF generators. Callers
+    that talk to a fast internal host (e.g. http://localhost:8000)
+    should pass something short like httpx.Timeout(4.0, connect=2.0)
+    so a missing photo fails fast.
+    """
+    if src.startswith("data:"):
+        return base64.b64decode(src.split(",", 1)[1])
+    elif src.startswith("http"):
+        try:
+            import httpx
+            response = httpx.get(src, timeout=timeout, follow_redirects=True)
+            ct = response.headers.get("content-type", "")
+            logger.info(f"[PDF img] {src[:100]} → {response.status_code}, content-type={ct}, size={len(response.content)}B")
+            if response.status_code == 200 and "image" in ct:
+                return response.content
+            elif response.status_code == 200:
+                logger.warning(f"[PDF img] Non-image response ({ct}) — skipping")
+        except Exception as e:
+            logger.warning(f"[PDF img] Fetch failed for {src[:80]}: {e}")
+    return b""
+
+
+def load_image(src, max_w, max_h, timeout=10):
+    """Load image from URL, base64 data URI, bytes, or file path.
+
+    `timeout` is forwarded to load_image_from_source when src is an
+    http(s) URL; ignored for data URIs / bytes / file paths. Default
+    10s keeps the previous wycena/inspection behavior unchanged.
+    """
+    try:
+        if isinstance(src, str) and (src.startswith("http") or src.startswith("data:")):
+            data = load_image_from_source(src, timeout=timeout)
+            if not data:
+                return None
+        elif isinstance(src, (bytes, bytearray)):
+            data = src
+        else:
+            with open(str(src), "rb") as f:
+                data = f.read()
+        buf = io.BytesIO(data)
+        img = Image(buf)
+        ratio = min(max_w / img.imageWidth, max_h / img.imageHeight)
+        img.drawWidth = img.imageWidth * ratio
+        img.drawHeight = img.imageHeight * ratio
+        return img
+    except Exception as e:
+        logger.warning(f"[PDF img] Image load failed: {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION BUILDERS
+# ═══════════════════════════════════════════════════════════════
+
+def build_dane_ogledzen(d, w):
+    """DANE OGLĘDZIN — 2×2 grid: company, location, user, date."""
+    fn, fnb = _fn()
+    h = w / 2
+    rows = [
+        [pb("Nazwa firmy"),    p(val(d, "company_name", "nazwa_firmy")),
+         pb("Miejsce oględzin"), p(val(d, "inspection_location", "location", "inspection_place"))],
+        [pb("Użytkownik"),     p(val(d, "inspector_name", "appraiser_name", "client_name")),
+         pb("Data oględzin"),   p(fmt_date(val(d, "inspection_date", "data_ogledzen")))],
+    ]
+    t = Table(rows, colWidths=[h * 0.28, h * 0.22, h * 0.28, h * 0.22])
+    ts = _grid_ts()
+    ts.add("BACKGROUND", (0, 0), (0, -1), LIGHT_GREY)
+    ts.add("BACKGROUND", (2, 0), (2, -1), LIGHT_GREY)
+    ts.add("FONTNAME", (0, 0), (0, -1), fnb)
+    ts.add("FONTNAME", (2, 0), (2, -1), fnb)
+    t.setStyle(ts)
+    return t
+
+
+def _fluid_level(v):
+    """Translate a ToggleValue (TAK/NIE/ND) into a human-readable fluid level."""
+    s = str(v or "").strip().upper()
+    if s in ("TAK", "OK", "YES", "TRUE", "1"):
+        return "OK"
+    if s in ("NIE", "NOK", "NO", "FALSE", "0"):
+        return "Niski / do uzupełnienia"
+    if s == "ND":
+        return "Nie dotyczy"
+    return ""
+
+
+def build_dane_pojazdu(d, w):
+    """DANE POJAZDU — 4-column vehicle data grid.
+
+    Only fields actually collected by the PWA are rendered here. Fields that
+    were in the original client template but aren't captured by the app
+    (insurance, policy number, technical inspection date, fluid levels that
+    we don't measure, etc.) have been removed so the PDF stays clean.
+    """
+    fn, fnb = _fn()
+    h = w / 2
+    lw, vw = h * 0.40, h * 0.60
+
+    V = lambda *k: val(d, *k)
+
+    def r(l1, v1, l2, v2):
+        return [pb(l1), p(v1), pb(l2), p(v2)]
+
+    make_model = V("make_model")
+    if not make_model:
+        make_model = f"{V('make', 'vehicle_brand')} {V('model', 'vehicle_model')}".strip()
+
+    rows = [
+        r("Numer rejestracyjny",    V("plates", "registration_plates", "registrationPlates"),
+          "Marka, model",           make_model or V("TITLE")),
+        r("Rok produkcji",          V("year", "rok_produkcji"),
+          "VIN",                    V("vin", "VIN")),
+        r("Przebieg (km)",          V("mileage", "przebieg"),
+          "Data 1 rej.",            fmt_date(V("first_registration", "firstRegistration"))),
+        r("Kolor",                  V("color", "kolor"),
+          "Rodzaj paliwa",          V("fuel_type", "fuelType", "rodzaj_paliwa")),
+        r("Skrzynia biegów",        V("gearbox", "skrzynia_biegow", "transmission"),
+          "Napęd",                  V("drive", "naped", "driveType")),
+        r("Liczba drzwi",           V("doors", "liczba_drzwi"),
+          "", ""),
+        r("Ilość miejsc siedz.",    V("seats", "ilosc_miejsc", "seatsCount"),
+          "Masa własna (kg)",       V("kerb_weight", "masa_wlasna", "ownWeight")),
+        r("Pojemność silnika (cm³)", V("engine_capacity", "pojemnosc", "engineCapacity"),
+          "Moc (KM)",               V("power_kw", "moc", "enginePower")),
+        r("Stan poziomu oleju",     _fluid_level(V("oil_level", "engineOilLevel")),
+          "Stan poziomu płynu\nchłodniczego", _fluid_level(V("coolant_level", "coolantLevel"))),
+    ]
+    t = Table(rows, colWidths=[lw, vw, lw, vw])
+    ts = _grid_ts()
+    ts.add("BACKGROUND", (0, 0), (0, -1), LIGHT_GREY)
+    ts.add("BACKGROUND", (2, 0), (2, -1), LIGHT_GREY)
+    ts.add("FONTNAME", (0, 0), (0, -1), fnb)
+    ts.add("FONTNAME", (2, 0), (2, -1), fnb)
+    t.setStyle(ts)
+    return t
+
+
+def build_wyposazenie(eq, w):
+    """WYPOSAŻENIE — checklist table with TAK/X/NIE/X columns."""
+    fn, fnb = _fn()
+    col_w = [w * 0.50, w * 0.12, w * 0.076, w * 0.12, w * 0.076]
+
+    ITEMS = [
+        ("Dowód rejestracyjny",                     "dowod_rejestracyjny"),
+        ("Karta pojazdu",                           "karta_pojazdu"),
+        ("Tablice rejestracyjne",                   "tablice_rejestracyjne"),
+        ("Kluczyki",                                "kluczyki"),
+        ("Kluczyki (ilość)",                        "kluczyki_ilosc"),
+        ("Dodatkowy komplet kół",                   "dodatkowy_komplet_kol"),
+        ("Gaśnica",                                 "gasnica"),
+        ("Klimatyzacja sprawna",                    "klimatyzacja_sprawna"),
+        ("Klucz do kół",                            "klucz_do_kol"),
+        ("Książka serwisowa",                       "ksiazka_serwisowa"),
+        ("Nawigacja satelitarna (karta) sprawna",   "nawigacja_satelitarna"),
+        ("Podnośnik",                               "podnosnik"),
+        ("Przewód ładowania baterii trakcyjnej",    "przewod_ladowania_baterii"),
+        ("Stacja ładowania baterii trakcyjnej",     "stacja_ladowania_baterii"),
+        ("Trójkąt ostrzegawczy",                    "trojkat_ostrzegawczy"),
+        ("Wskaźnik naładowania baterii trakcyjnej", "wskaznik_naladowania_baterii"),
+        ("Zestaw naprawczy koła",                   "zestaw_naprawczy_kola"),
+        ("Kable do ładowania",                      "kable_do_ladowania"),
+        ("VIN zgodny z dokumentami",                "vin_zgodny_z_dokumentami"),
+        ("Instrukcja obsługi",                      "instrukcja_obslugi"),
+        ("Dodatkowe wyposażenie",                   "dodatkowe_wyposazenie"),
+    ]
+
+    rows = [[p(""), pc("TAK", True), pc(""), pc("NIE", True), pc("")]]
+
+    for label, key in ITEMS:
+        raw = str(eq.get(key, "") or "").strip().upper()
+
+        if label in ("Kluczyki (ilość)", "Dodatkowe wyposażenie"):
+            # Show free-text value in the middle columns
+            text_val = str(eq.get(key, "") or "")
+            rows.append([p(label), p(""), pc(text_val), p(""), p("")])
+        elif raw == "ELEKTRONICZNA":
+            rows.append([p(label), p(""), pc("ELEKTRO-\nNICZNA"), p(""), p("")])
+        elif raw in ("TAK", "YES", "TRUE", "1"):
+            rows.append([p(label), pc("TAK"), pc("X"), pc("NIE"), p("")])
+        elif raw in ("NIE", "NO", "FALSE", "0"):
+            rows.append([p(label), pc("TAK"), p(""), pc("NIE"), pc("X")])
+        else:
+            rows.append([p(label), pc("TAK"), p(""), pc("NIE"), p("")])
+
+    t = Table(rows, colWidths=col_w)
+    ts = _grid_ts()
+    ts.add("BACKGROUND", (0, 0), (-1, 0), LIGHT_GREY)
+    ts.add("ALIGN", (1, 0), (-1, -1), "CENTER")
+    t.setStyle(ts)
+    return t
+
+
+def build_nadwozie(damages, w):
+    """NADWOZIE — exterior damage table with 4 damage type columns."""
+    fn, fnb = _fn()
+    col_w = [w * 0.38, w * 0.155, w * 0.155, w * 0.155, w * 0.155]
+    header = [
+        p(""), pc("Rysa/Odprysk", True), pc("Wniec./Odksz.", True),
+        pc("Pękn./Rozerw.", True), pc("Rozmiar", True),
+    ]
+    rows = [header]
+    notes = []
+
+    for dmg in (damages or []):
+        dtype = str(dmg.get("damage_type", dmg.get("type", ""))).lower()
+        size  = str(dmg.get("size", ""))
+        note  = dmg.get("notes", dmg.get("description", ""))
+        loc   = dmg.get("location", dmg.get("panel", dmg.get("element", dmg.get("part", ""))))
+
+        rows.append([
+            p(loc),
+            pc("X") if any(x in dtype for x in ("rysa", "odprysk", "scratch")) else pc(""),
+            pc("X") if any(x in dtype for x in ("wgn", "wgniecenie", "odkszt", "odkształcenie", "dent")) else pc(""),
+            pc("X") if any(x in dtype for x in ("pękni", "pęknięcie", "rozerwanie", "crack")) else pc(""),
+            pc(size),
+        ])
+        if note:
+            notes.append(note)
+
+    if len(rows) == 1:
+        rows.append([p("Brak uszkodzeń"), p(""), p(""), p(""), p("")])
+
+    t = Table(rows, colWidths=col_w)
+    ts = _grid_ts()
+    ts.add("BACKGROUND", (0, 0), (-1, 0), LIGHT_GREY)
+    ts.add("ALIGN", (1, 0), (-1, -1), "CENTER")
+    t.setStyle(ts)
+
+    result = [t]
+    if notes:
+        fn_r, _ = _fn()
+        result.append(p("*" + ", ".join(notes),
+                        _style("_fn", fontName=fn_r, fontSize=6, leading=8)))
+    return result
+
+
+def build_wnetrze(damages, w):
+    """WNĘTRZE — interior damage table. Special row for 'Pranie / czyszczenie'."""
+    fn, fnb = _fn()
+    col_w = [w * 0.38, w * 0.155, w * 0.155, w * 0.155, w * 0.155]
+    header = [
+        p(""), pc("Rysa/Odprysk", True), pc("Wniec./Odksz.", True),
+        pc("Pękn./Rozerw.", True), p(""),
+    ]
+    rows = [header]
+
+    for dmg in (damages or []):
+        loc   = str(dmg.get("location", dmg.get("element", dmg.get("part", ""))))
+        dtype = str(dmg.get("damage_type", dmg.get("type", ""))).lower()
+        size  = str(dmg.get("size", ""))
+
+        if "pranie" in loc.lower() or "czyszcz" in loc.lower():
+            rows.append([p("Pranie / czyszczenie"), p(""), p(""), p(""), pc("TAK")])
+        else:
+            rows.append([
+                p(loc),
+                pc("X") if any(x in dtype for x in ("rysa", "odprysk", "scratch")) else pc(""),
+                pc("X") if any(x in dtype for x in ("wgn", "odkszt", "dent")) else pc(""),
+                pc("X") if any(x in dtype for x in ("pękni", "rozerwanie", "crack")) else pc(""),
+                pc(size),
+            ])
+
+    if len(rows) == 1:
+        rows.append([p("Brak uszkodzeń"), p(""), p(""), p(""), p("")])
+
+    t = Table(rows, colWidths=col_w)
+    ts = _grid_ts()
+    ts.add("BACKGROUND", (0, 0), (-1, 0), LIGHT_GREY)
+    ts.add("ALIGN", (1, 0), (-1, -1), "CENTER")
+    t.setStyle(ts)
+    return t
+
+
+def build_opony(tires, w):
+    """OPONY — tire table with 4 positions, size split into sub-columns."""
+    fn, fnb = _fn()
+    # Columns: Position | Producent | Typ | 4 size subcols | Profil | Rodzaj opon
+    col_w = [w * 0.18, w * 0.11, w * 0.09, w * 0.09, w * 0.06, w * 0.06, w * 0.06, w * 0.12, w * 0.13]
+    header = [
+        p(""), pc("Producent", True), pc("Typ", True),
+        pc("Oznaczenie\nopon", True), pc("", True), pc("", True), pc("", True),
+        pc("Profil", True), pc("Rodzaj\nopon", True),
+    ]
+
+    POSITIONS = [
+        ("Opona Prawa Przód", "front_right", "frontRight", "przod_prawy"),
+        ("Opona Prawa Tył",   "rear_right",  "rearRight",  "tyl_prawy"),
+        ("Opona Lewa Tył",    "rear_left",   "rearLeft",   "tyl_lewy"),
+        ("Opona Lewa Przód",  "front_left",  "frontLeft",  "przod_lewy"),
+    ]
+
+    SEASON_LABELS = {
+        "summer": "Letnie", "lato": "Letnie",
+        "winter": "Zimowe", "zima": "Zimowe",
+        "all-season": "Całoroczne", "all_season": "Całoroczne",
+        "allseason": "Całoroczne", "calorocz": "Całoroczne",
+    }
+
+    def _season(v):
+        s = str(v or "").strip().lower()
+        return SEASON_LABELS.get(s, v or "")
+
+    rows = [header]
+    for label, *keys in POSITIONS:
+        td = None
+        for k in keys:
+            td = tires.get(k)
+            if td and isinstance(td, dict):
+                break
+        if not td or not isinstance(td, dict):
+            td = {}
+
+        size_str = val(td, "size", "oznaczenie", "rozmiar", default="")
+        load_idx = val(td, "loadIndex", "load_index", default="")
+        speed_idx = val(td, "speedIndex", "speed_index", default="")
+        # Append the load+speed index to the size string if not already there, so
+        # the 4 sub-columns get populated: ["225", "55", "R17", "96V"].
+        if (load_idx or speed_idx) and not re.search(r'\d{2,3}[A-Z]', size_str):
+            size_str = f"{size_str} {load_idx}{speed_idx}".strip()
+        parts = re.split(r'[\s/]+', size_str) if size_str else []
+        # Tread depth may carry a "mm" suffix or be a raw number
+        tread = val(td, "treadDepth", "profil", "profile", default="")
+        if tread and not re.search(r'(?i)mm', str(tread)):
+            tread = f"{tread} mm"
+
+        rows.append([
+            p(label),
+            pc(val(td, "brand", "producent", "marka")),
+            pc(val(td, "model", "modelu", "typ")),
+            pc(parts[0] if len(parts) > 0 else ""),
+            pc(parts[1] if len(parts) > 1 else ""),
+            pc(parts[2] if len(parts) > 2 else ""),
+            pc(parts[3] if len(parts) > 3 else ""),
+            pc(tread),
+            pc(_season(val(td, "type", "tire_type", "rodzaj_opon", "season"))),
+        ])
+
+    t = Table(rows, colWidths=col_w)
+    ts = _grid_ts()
+    ts.add("BACKGROUND", (0, 0), (-1, 0), LIGHT_GREY)
+    ts.add("ALIGN", (0, 0), (-1, -1), "CENTER")
+    t.setStyle(ts)
+    return t
+
+
+def build_signatures(d, w):
+    """3 signature boxes side-by-side with labels and signature images.
+
+    Slot layout matches the client template:
+      0 — Rzeczoznawca / Ekspert mobilny  → finalSummary.signatureAppraiser
+      1 — Strona przyjmująca na plac      → finalSummary.signatureYard
+      2 — Dysponent pojazdu w chwili oględzin → finalSummary.signatureClient
+          If isAbsentRep is true, render absentRepComment instead of a signature.
+    """
+    fn, fnb = _fn()
+    sw = (w - 1.0 * cm) / 3
+
+    labels = [
+        "Potwierdzam zwrot pojazdu\nw stanie opisanym powyżej.\n\nPodpis Rzeczoznawcy/\nEksperta mobilnego\nZaufaj Rzeczoznawcy",
+        "Potwierdzam przyjęcie pojazdu\nw stanie opisanym powyżej.\n\nPodpis strony przyjmującej\nna plac",
+        "Potwierdzam zwrot pojazdu\nw stanie opisanym powyżej.\n\nPodpis dysponenta pojazdu\nw chwili oględzin",
+    ]
+
+    # Flat-keys first, then camelCase fallbacks. Yard is slot 1, client is slot 2.
+    sig_keys = [
+        ("signature_appraiser", "signatureAppraiser", "podpis_rzeczoznawcy"),
+        ("signature_yard", "signatureYard", "signature_owner", "podpis_przyjmujacego"),
+        ("signature_client", "signatureClient", "podpis_dysponenta"),
+    ]
+
+    summary = d.get("finalSummary", {}) or {}
+    is_absent_rep = bool(
+        d.get("is_absent_rep")
+        or d.get("isAbsentRep")
+        or summary.get("isAbsentRep")
+    )
+    absent_comment = (
+        d.get("absent_rep_comment")
+        or d.get("absentRepComment")
+        or summary.get("absentRepComment")
+        or ""
+    )
+
+    cells = []
+    for i in range(3):
+        sig_data = None
+        for k in sig_keys[i]:
+            sig_data = d.get(k)
+            if sig_data:
+                break
+        if not sig_data:
+            for k in sig_keys[i]:
+                sig_data = summary.get(k)
+                if sig_data:
+                    break
+
+        label_style = _style(f"_sl{i}", fontSize=6, leading=8, alignment=TA_CENTER)
+        cell_content = [p(labels[i], label_style), sp(0.15)]
+
+        # Slot 2 (client / dysponent): if the client was absent, render the
+        # absent-rep comment in place of a signature — mirrors the in-app text
+        # note that replaces the signature pad for absent clients.
+        if i == 2 and is_absent_rep and not sig_data:
+            absent_style = _style("_sl2_abs", fontSize=6, leading=8, alignment=TA_CENTER)
+            cell_content.append(p("(Dysponent nieobecny)", absent_style))
+            cell_content.append(sp(0.1))
+            if absent_comment:
+                cell_content.append(p(str(absent_comment), absent_style))
+            else:
+                cell_content.append(sp(1.6))
+        else:
+            sig_img = load_image(sig_data, sw - 0.8 * cm, 2.0 * cm) if sig_data else None
+            cell_content.append(sig_img if sig_img else sp(2.0))
+        cells.append(cell_content)
+
+    t = Table([cells], colWidths=[sw, sw, sw])
+    t.setStyle(TableStyle([
+        ("BOX",           (0, 0), (-1, -1), 0.5, MID_GREY),
+        ("INNERGRID",     (0, 0), (-1, -1), 0.5, MID_GREY),
+        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 6),
+        ("TOPPADDING",    (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return t
+
+
+def build_photos(photos, w):
+    """DOKUMENTACJA ZDJĘCIOWA — 3-column photo grid."""
+    if not photos:
+        return []
+
+    cw = (w - 0.6 * cm) / 3
+    ch = cw * 0.72
+    rows = []
+    row = []
+
+    for photo in photos:
+        img = load_image(photo, cw - 0.4 * cm, ch - 0.4 * cm)
+        row.append(img if img else p(""))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+
+    if row:
+        while len(row) < 3:
+            row.append(p(""))
+        rows.append(row)
+
+    if not rows:
+        return []
+
+    t = Table(rows, colWidths=[cw, cw, cw], rowHeights=[ch] * len(rows))
+    t.setStyle(TableStyle([
+        ("GRID",          (0, 0), (-1, -1), 0.5, MID_GREY),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 3),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    return [t]
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN GENERATOR — matches old signature for backwards compat
+# ═══════════════════════════════════════════════════════════════
+
+def generate_inspection_pdf(deal_info: dict, inspection_data: dict, logo_path: str = None) -> bytes:
+    """
+    Generate the Protokół zwrotu pojazdu PDF.
+
+    Accepts the SAME arguments as the old generator for backwards compatibility:
+      - deal_info: dict with title, order_number, company_name, etc.
+      - inspection_data: dict with vehicleData, equipment, damages, etc.
+
+    Also supports flat dict format where all keys are at top level.
+    """
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=MARGIN, bottomMargin=MARGIN,
+        title="Protokół zwrotu pojazdu",
+    )
+
+    fn, fnb = _fn()
+    w = CONTENT_W
+
+    # ── Merge deal_info into inspection_data for unified access ──
+    # Support both old camelCase keys AND new snake_case keys
+    d = {}
+    d.update(inspection_data)
+    d.update(deal_info)
+
+    # Extract nested data (old format has camelCase sub-dicts)
+    vehicle = inspection_data.get("vehicleData", {})
+    basic = vehicle.get("basicInfo", {})
+    eq_comp = inspection_data.get("equipmentCompleteness", {})
+    full_eq = inspection_data.get("fullEquipment", {})
+    mech = inspection_data.get("mechanical", {})
+    summary = inspection_data.get("finalSummary", {})
+
+    # Build flat dict with all possible keys for maximum compatibility.
+    # Bitrix deal_info fields can arrive as empty strings, so we use a
+    # "prefer non-empty" helper instead of setdefault — otherwise an empty
+    # Bitrix value silently blocks the PWA fallback and the field renders blank.
+    flat = {}
+    flat.update(d)
+
+    def _set(key, value):
+        if value is None:
+            return
+        sval = str(value).strip()
+        if not sval:
+            return
+        if not str(flat.get(key, "") or "").strip():
+            flat[key] = sval
+
+    if vehicle:
+        _set("vin",                vehicle.get("vin"))
+        _set("make",               vehicle.get("make"))
+        _set("model",              vehicle.get("model"))
+        _set("year",               vehicle.get("year"))
+        _set("mileage",            vehicle.get("mileage"))
+        _set("color",              vehicle.get("color"))
+        _set("fuel_type",          vehicle.get("fuelType"))
+        _set("seats",              vehicle.get("seatsCount"))
+        _set("drive",              vehicle.get("driveType"))
+        _set("kerb_weight",        vehicle.get("ownWeight"))
+        _set("engine_capacity",    vehicle.get("engineCapacity"))
+        _set("power_kw",           vehicle.get("enginePower"))
+        _set("first_registration", vehicle.get("firstRegistration"))
+        _set("plates",             vehicle.get("registrationPlates") or vehicle.get("registrationNumber"))
+        _set("gearbox",            vehicle.get("gearboxType"))
+        _set("doors",              vehicle.get("doorsCount"))
+    if basic:
+        _set("company_name",       basic.get("companyName"))
+        _set("inspection_location", basic.get("inspectionPlace"))
+        _set("inspector_name",     basic.get("userOwner"))
+        _set("inspection_date",    basic.get("inspectionDate"))
+        _set("client_name",        basic.get("clientName"))
+    if mech:
+        _set("coolant_level",      mech.get("coolantLevel"))
+        _set("oil_level",          mech.get("engineOilLevel"))
+    if summary:
+        _set("signature_appraiser", summary.get("signatureAppraiser"))
+        _set("signature_client",    summary.get("signatureClient"))
+        _set("signature_yard",      summary.get("signatureYard"))
+        _set("is_absent_rep",       summary.get("isAbsentRep"))
+        _set("absent_rep_comment",  summary.get("absentRepComment"))
+
+    # Order number
+    order_number = val(flat, "order_number", "nr_zlecenia", "deal_number", "title", default="ZR/2025/XXXXX")
+
+    # Equipment — try new flat keys first, then map from equipmentCompleteness
+    equipment = inspection_data.get("equipment", {}) or {}
+    if not equipment and eq_comp:
+        def _tv(key):
+            """Return 'TAK', 'NIE', 'ELEKTRONICZNA', 'ND', or '' from a ToggleValue field."""
+            v = str(eq_comp.get(key, "") or "").strip().upper()
+            return v if v in ("TAK", "NIE", "ND", "ELEKTRONICZNA") else ""
+
+        equipment = {
+            # Items 1-4
+            "dowod_rejestracyjny":          _tv("registrationDocPresented"),
+            "karta_pojazdu":                _tv("vehicleCardPresented"),
+            "tablice_rejestracyjne":        _tv("registrationPlates"),
+            "kluczyki":                     _tv("keys"),
+            # Item 5 — count
+            "kluczyki_ilosc":               str(eq_comp.get("keysCount", "") or ""),
+            # Items 6-9
+            "dodatkowy_komplet_kol":        _tv("spareWheel"),
+            "gasnica":                      _tv("fireExtinguisher"),
+            "klimatyzacja_sprawna":         _tv("airConditioningWorking"),
+            "klucz_do_kol":                 _tv("wheelWrench"),
+            # Item 10 — may be ELEKTRONICZNA
+            "ksiazka_serwisowa":            _tv("serviceBookPresented"),
+            # Items 11-17
+            "nawigacja_satelitarna":        _tv("navigationCardWorking"),
+            "podnosnik":                    _tv("jackAndTools"),
+            "przewod_ladowania_baterii":    _tv("tractionBatteryChargingCable"),
+            "stacja_ladowania_baterii":     _tv("tractionBatteryChargingStation"),
+            "trojkat_ostrzegawczy":         _tv("triangular"),
+            "wskaznik_naladowania_baterii": _tv("tractionBatteryChargeIndicator"),
+            "zestaw_naprawczy_kola":        _tv("repairKit"),
+            # Items 18-21
+            "kable_do_ladowania":           _tv("chargingCables"),
+            "vin_zgodny_z_dokumentami":     _tv("vinMatchesDocs"),
+            "instrukcja_obslugi":           _tv("ownerManual"),
+            "dodatkowe_wyposazenie":        str(eq_comp.get("additionalEquipment", "") or ""),
+        }
+
+    # Damages
+    ext_damages = inspection_data.get("exterior_damages", []) or inspection_data.get("exteriorDamage", []) or []
+    int_damages = inspection_data.get("interior_damages", []) or inspection_data.get("interiorDamage", []) or []
+
+    # Tires
+    tires = inspection_data.get("tires", {}) or {}
+
+    # Photos
+    photos = inspection_data.get("photos", []) or []
+
+    # Location and date for bottom of page 3
+    insp_date = fmt_date(val(flat, "inspection_date", "data_ogledzen"))
+    insp_location = val(flat, "inspection_location", "location", "inspection_place")
+
+    # Title styles
+    title_style = _style("_title", fontName=fnb, fontSize=16, leading=20, alignment=TA_CENTER)
+    order_style = _style("_order", fontName=fnb, fontSize=11, leading=14, alignment=TA_CENTER)
+    photo_style = _style("_photo", fontName=fnb, fontSize=12, leading=15, alignment=TA_CENTER)
+    small_style = _style("_small", fontSize=7, leading=9)
+    gdpr_style  = _style("_gdpr",  fontSize=6, leading=8)
+
+    # ═══ PAGE 1 ═══════════════════════════════════════════════
+    story = []
+    story.append(Paragraph("Protokół zwrotu pojazdu", title_style))
+    story.append(sp(0.5))
+    story.append(Paragraph(f"NR ZLECENIA : {order_number}", order_style))
+    story.append(sp(0.5))
+
+    story.append(section_header("DANE OGLĘDZIN", w))
+    story.append(sp(0.1))
+    story.append(build_dane_ogledzen(flat, w))
+    story.append(sp(0.4))
+
+    story.append(section_header("DANE POJAZDU", w))
+    story.append(sp(0.1))
+    story.append(build_dane_pojazdu(flat, w))
+    story.append(sp(0.4))
+
+    story.append(section_header("WYPOSAŻENIE", w))
+    story.append(sp(0.1))
+    story.append(build_wyposazenie(equipment, w))
+
+    # ═══ PAGE 3 (auto page break from Page 1/2) ══════════════
+    story.append(PageBreak())
+    story.append(Paragraph("Protokół zwrotu pojazdu", title_style))
+    story.append(sp(0.4))
+
+    story.append(section_header("NADWOZIE", w))
+    story.append(sp(0.1))
+    story.extend(build_nadwozie(ext_damages, w))
+    story.append(sp(0.3))
+
+    # Footnote
+    story.append(p("*Korozja, zabrudzenie, przepalenie", gdpr_style))
+    story.append(sp(0.2))
+
+    story.append(section_header("WNĘTRZE", w))
+    story.append(sp(0.1))
+    story.append(build_wnetrze(int_damages, w))
+    story.append(sp(0.3))
+
+    story.append(section_header("OPONY", w))
+    story.append(sp(0.1))
+    story.append(build_opony(tires, w))
+    story.append(sp(0.5))
+
+    # Location + Date row
+    loc_row = Table(
+        [[pb("Miejsce oględzin"), p(insp_location), pb("Data oględzin"), p(insp_date)]],
+        colWidths=[w * 0.22, w * 0.38, w * 0.22, w * 0.18],
+    )
+    loc_row.setStyle(TableStyle([
+        ("LEFTPADDING",  (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("VALIGN",       (0, 0), (-1, -1), "BOTTOM"),
+    ]))
+    story.append(loc_row)
+    story.append(sp(0.3))
+
+    # GDPR line
+    story.append(p(
+        "Zapoznałem/am się z klauzulą informacyjną dotyczącą przetwarzania moich danych osobowych.",
+        gdpr_style,
+    ))
+    story.append(sp(0.3))
+
+    # Signatures
+    story.append(build_signatures(flat, w))
+
+    # ═══ PAGE 4 — PHOTOS (only if exist) ══════════════════════
+    if photos:
+        story.append(PageBreak())
+        story.append(Paragraph("DOKUMENTACJA ZDJĘCIOWA", photo_style))
+        story.append(sp(0.5))
+        story.extend(build_photos(photos, w))
+
+    # Build
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
