@@ -1,0 +1,1636 @@
+"use client"
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react"
+import { useRouter } from "next/navigation"
+import type {
+  MacadamData,
+  MacadamPart,
+  MacadamVehicleHeader,
+  MacadamTireOverride,
+  MacadamDocOverride,
+  Qualification,
+} from "@/types/kosztorysMacadam"
+
+const QUAL_OPTIONS: { value: Qualification; label: string }[] = [
+  { value: "",             label: "— wybierz —" },
+  { value: "lakierowanie", label: "Lakierowanie" },
+  { value: "naprawa",      label: "Naprawa" },
+  { value: "wymiana",      label: "Wymiana" },
+  { value: "akceptowalne", label: "Akceptowalne (bez kosztu)" },
+]
+
+const VAT_RATE = 1.23
+const r2 = (n: number) => Math.round(n * 100) / 100
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+
+// Downscale + JPEG-compress a data-URI so admin-added phone photos don't bloat
+// the saved JSON. Caps the longest edge and re-encodes as JPEG. Robust: on any
+// failure (load/canvas error) it falls back to the original data URL.
+async function compressImageDataUrl(
+  dataUrl: string,
+  maxEdge = 1600,
+  quality = 0.8,
+): Promise<string> {
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const im = new Image()
+      im.onload = () => resolve(im)
+      im.onerror = reject
+      im.src = dataUrl
+    })
+    const longest = Math.max(img.width, img.height)
+    const scale = longest > maxEdge ? maxEdge / longest : 1
+    const w = Math.max(1, Math.round(img.width * scale))
+    const h = Math.max(1, Math.round(img.height * scale))
+    const canvas = document.createElement("canvas")
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext("2d")
+    if (!ctx) return dataUrl
+    ctx.drawImage(img, 0, 0, w, h)
+    return canvas.toDataURL("image/jpeg", quality)
+  } catch {
+    return dataUrl
+  }
+}
+
+interface AvailableDamage {
+  source: "ext" | "int"
+  index: number | null
+  location: string
+  type: string
+  size: string
+  description: string
+  photo_urls: string[]
+}
+
+interface MacadamGetResponse extends MacadamData {
+  available_damages: AvailableDamage[]
+  // Populated lists for the editor: saved override if present, else inspection.
+  tires?: MacadamTireOverride[]
+  documents?: MacadamDocOverride[]
+}
+
+const emptyVehicle = (): MacadamVehicleHeader => ({
+  make_model: "",
+  variant: "",
+  vin: "",
+  registration_plate: "",
+  grupa: "",
+  mileage_km: null,
+  first_registration: "",
+  body_colour: "",
+  klient: "",
+  inspection_date: "",
+  inspection_address: "",
+  main_photo_url: null,
+})
+
+const newPartId = () =>
+  (typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
+
+function reindex(parts: MacadamPart[]): MacadamPart[] {
+  return parts.map((p, i) => ({ ...p, index: i + 1 }))
+}
+
+// Older saved data may not have the cost-engine fields yet.
+function normalisePart(p: Partial<MacadamPart> & { id?: string; index?: number }): MacadamPart {
+  return {
+    id:                    p.id ?? newPartId(),
+    index:                 p.index ?? 0,
+    location:              p.location === "interior" ? "interior" : "exterior",
+    czesc:                 p.czesc ?? "",
+    typ:                   p.typ ?? "",
+    tryb_naprawy:          p.tryb_naprawy ?? "",
+    qualification:         (p.qualification ?? "") as Qualification,
+    repair_time_h:         p.repair_time_h ?? null,
+    parts_cost_pln:        p.parts_cost_pln ?? null,
+    is_manual:             p.is_manual ?? false,
+    apply_depreciation:    p.apply_depreciation ?? true,
+    koszty_naprawy_pln:    p.koszty_naprawy_pln ?? null,
+    koszt_amortyzacji_pln: p.koszt_amortyzacji_pln ?? null,
+    koszt_netto_pln:       p.koszt_netto_pln ?? null,
+    photos:                p.photos ?? [],
+  }
+}
+
+// ─── Cost engine — must match backend (routers/kosztorys_costs.py) ──────────
+// Backend recomputes on PUT (source of truth); this version drives the live
+// preview while the appraiser types.
+function computePartCosts(
+  part: Pick<MacadamPart, "qualification" | "repair_time_h" | "parts_cost_pln" | "is_manual" | "apply_depreciation">,
+  rate: number | null,
+  deprPct: number | null,
+): { koszty_naprawy_pln: number; koszt_amortyzacji_pln: number; koszt_netto_pln: number } {
+  const r = rate ?? 0
+  // Per-part toggle: when apply_depreciation is explicitly false, this part
+  // gets NO depreciation (amort 0, net = full). Default/undefined ⇒ ON.
+  const effD = part.apply_depreciation === false ? 0 : (deprPct ?? 0) / 100
+  const time = part.repair_time_h ?? 0
+  const parts = part.parts_cost_pln ?? 0
+
+  if (part.is_manual) {
+    return {
+      koszty_naprawy_pln:    r2(parts),
+      koszt_amortyzacji_pln: r2(parts * effD),
+      koszt_netto_pln:       r2(parts * (1 - effD)),
+    }
+  }
+  if (part.qualification === "akceptowalne") {
+    return { koszty_naprawy_pln: 0, koszt_amortyzacji_pln: 0, koszt_netto_pln: 0 }
+  }
+  const labour = time * r
+  if (part.qualification === "wymiana") {
+    return {
+      koszty_naprawy_pln:    r2(labour + parts),
+      koszt_amortyzacji_pln: r2(labour * effD),
+      koszt_netto_pln:       r2(labour * (1 - effD) + parts),
+    }
+  }
+  if (part.qualification === "naprawa" || part.qualification === "lakierowanie") {
+    return {
+      koszty_naprawy_pln:    r2(labour),
+      koszt_amortyzacji_pln: r2(labour * effD),
+      koszt_netto_pln:       r2(labour * (1 - effD)),
+    }
+  }
+  return { koszty_naprawy_pln: 0, koszt_amortyzacji_pln: 0, koszt_netto_pln: 0 }
+}
+
+function computeTotals(
+  parts: MacadamPart[],
+  rate: number | null,
+  deprPct: number | null,
+  materialCost: number | null,
+) {
+  let k = 0, a = 0, n = 0
+  for (const p of parts) {
+    const c = computePartCosts(p, rate, deprPct)
+    k += c.koszty_naprawy_pln
+    a += c.koszt_amortyzacji_pln
+    n += c.koszt_netto_pln
+  }
+  // Material + small parts — added straight to net (and koszty_naprawy
+  // headline). NOT depreciated. Mirrors backend _recompute.
+  const mat = materialCost ?? 0
+  n += mat
+  k += mat
+  return {
+    koszty_naprawy_pln: r2(k),
+    amortyzacja_pln:    r2(a),
+    netto_pln:          r2(n),
+    gross_pln:          r2(n * VAT_RATE),
+  }
+}
+
+function parseNumberOrNull(raw: string): number | null {
+  const cleaned = raw.replace(",", ".").trim()
+  if (cleaned === "") return null
+  const n = parseFloat(cleaned)
+  return Number.isFinite(n) ? n : null
+}
+
+// Mirror backend report.py _tire_status so the derived status stays consistent
+// with what the inspection would produce.
+function deriveTireStatus(treadMm: number | null | undefined): string {
+  if (treadMm === null || treadMm === undefined || !Number.isFinite(treadMm)) return "unknown"
+  if (treadMm >= 4.0) return "good"
+  if (treadMm >= 1.6) return "warn"
+  return "danger"
+}
+
+// Season select options (display label ↔ stored raw value used by the report).
+const SEASON_OPTIONS: { value: string; label: string }[] = [
+  { value: "",            label: "— brak —" },
+  { value: "summer",      label: "Letnie" },
+  { value: "winter",      label: "Zimowe" },
+  { value: "all-season",  label: "Całoroczne" },
+]
+
+// Documents status → status_type colour map (matches report.py + report render).
+const DOC_STATUS_OPTIONS = ["Tak", "Nie", "Elektroniczna", "Brak"]
+function docStatusType(status: string): string {
+  if (status === "Tak") return "green"
+  if (status === "Elektroniczna") return "blue"
+  return "red" // Nie | Brak
+}
+
+export default function AdminMacadamEditPage({
+  params,
+}: {
+  params: { dealId: string }
+}) {
+  const { dealId } = params
+  const router = useRouter()
+  const [token, setToken] = useState<string | null>(null)
+
+  const [vehicle, setVehicle] = useState<MacadamVehicleHeader>(emptyVehicle())
+  const [parts, setParts] = useState<MacadamPart[]>([])
+  const [available, setAvailable] = useState<AvailableDamage[]>([])
+  const [labourRate, setLabourRate] = useState<number | null>(null)
+  const [deprPct, setDeprPct] = useState<number | null>(null)
+  const [materialCost, setMaterialCost] = useState<number | null>(null)
+  // Pass-through display overrides (tires + documents checklist).
+  const [tires, setTires] = useState<MacadamTireOverride[]>([])
+  const [documents, setDocuments] = useState<MacadamDocOverride[]>([])
+
+  // Read-only subtotal: sum of per-part koszt_netto_pln across above-norm
+  // parts only (excludes akceptowalne, which have 0 cost by rule). Derived
+  // live from the same engine the per-part cells and save-bar totals use —
+  // never sent in the payload, never editable.
+  const partsNetto = useMemo(() => {
+    return parts
+      .filter(p => p.qualification !== "akceptowalne")
+      .reduce((s, p) => s + computePartCosts(p, labourRate, deprPct).koszt_netto_pln, 0)
+  }, [parts, labourRate, deprPct])
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [toast, setToast] = useState<{
+    kind: "ok" | "err"
+    msg: string
+  } | null>(null)
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const t = sessionStorage.getItem("admin_token")
+    if (!t) {
+      router.push("/admin")
+      return
+    }
+    setToken(t)
+  }, [router])
+
+  const fetchData = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await fetch(`${API_BASE}/kosztorys-costs/${dealId}`, {
+        cache: "no-store",
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const json: MacadamGetResponse = await res.json()
+      setVehicle(json.vehicle ?? emptyVehicle())
+      setParts(reindex((json.parts ?? []).map(normalisePart)))
+      setAvailable(json.available_damages ?? [])
+      setLabourRate(json.labour_rate_pln_per_h ?? null)
+      setDeprPct(json.depreciation_pct ?? null)
+      setMaterialCost(json.koszt_materialu_pln ?? null)
+      setTires(json.tires ?? [])
+      setDocuments(json.documents ?? [])
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setToast({ kind: "err", msg: `Nie udało się wczytać: ${msg}` })
+    } finally {
+      setLoading(false)
+    }
+  }, [dealId])
+
+  useEffect(() => {
+    if (token) void fetchData()
+  }, [token, fetchData])
+
+  const usedDamageKeys = useMemo(() => {
+    const used = new Set<string>()
+    for (const p of parts) {
+      const k = (p as MacadamPart & { _src_key?: string })._src_key
+      if (k) used.add(k)
+    }
+    return used
+  }, [parts])
+
+  const onAddDamage = (d: AvailableDamage) => {
+    const srcKey = `${d.source}-${d.index ?? ""}`
+    const part: MacadamPart & { _src_key?: string } = {
+      id: newPartId(),
+      index: parts.length + 1,
+      location: d.source === "int" ? "interior" : "exterior",
+      czesc: d.location || d.type || "",
+      typ: d.type,
+      tryb_naprawy: "",
+      qualification: "",
+      repair_time_h: null,
+      parts_cost_pln: null,
+      is_manual: false,
+      apply_depreciation: true,
+      koszty_naprawy_pln: null,
+      koszt_amortyzacji_pln: null,
+      koszt_netto_pln: null,
+      photos: [...d.photo_urls],
+    }
+    Object.defineProperty(part, "_src_key", {
+      value: srcKey,
+      enumerable: false,
+    })
+    setParts(prev => reindex([...prev, part]))
+  }
+
+  const onAddManual = () => {
+    const part: MacadamPart = {
+      id: newPartId(),
+      index: parts.length + 1,
+      location: "exterior",
+      czesc: "",
+      typ: "",
+      tryb_naprawy: "",
+      qualification: "naprawa",   // manual elements are depreciated like labour
+      repair_time_h: null,
+      parts_cost_pln: null,
+      is_manual: true,
+      apply_depreciation: true,
+      koszty_naprawy_pln: null,
+      koszt_amortyzacji_pln: null,
+      koszt_netto_pln: null,
+      photos: [],
+    }
+    setParts(prev => reindex([...prev, part]))
+  }
+
+  const updatePart = (id: string, patch: Partial<MacadamPart>) => {
+    setParts(prev => prev.map(p => (p.id === id ? { ...p, ...patch } : p)))
+  }
+
+  const removePart = (id: string) => {
+    setParts(prev => reindex(prev.filter(p => p.id !== id)))
+  }
+
+  const removePhotoFromPart = (partId: string, photoIdx: number) => {
+    setParts(prev =>
+      prev.map(p =>
+        p.id === partId
+          ? { ...p, photos: p.photos.filter((_, i) => i !== photoIdx) }
+          : p
+      )
+    )
+  }
+
+  // Append an admin-added photo (data-URI string) to a part, preserving the
+  // existing report-pulled photos. They are all just strings in the same array,
+  // so removePhotoFromPart removes them identically.
+  const addPhotoToPart = (partId: string, dataUri: string) => {
+    setParts(prev =>
+      prev.map(p =>
+        p.id === partId
+          ? { ...p, photos: [...p.photos, dataUri] }
+          : p
+      )
+    )
+  }
+
+  // Tires/documents are display overrides — edited immutably, sent verbatim.
+  const updateTire = (idx: number, patch: Partial<MacadamTireOverride>) => {
+    setTires(prev => prev.map((t, i) => (i === idx ? { ...t, ...patch } : t)))
+  }
+
+  const updateDocStatus = (idx: number, status: string) => {
+    setDocuments(prev =>
+      prev.map((d, i) =>
+        i === idx ? { ...d, status, status_type: docStatusType(status) } : d
+      )
+    )
+  }
+
+  const onSave = async () => {
+    if (!token) return
+    // Strip the non-enumerable _src_key off the parts before sending,
+    // and stamp the locally-computed cost fields onto each part. The
+    // backend recomputes authoritatively, but sending the values keeps
+    // the saved JSON readable + the public report rendering instantly.
+    const cleanParts: MacadamPart[] = parts.map(p => {
+      const c = computePartCosts(p, labourRate, deprPct)
+      return {
+        id:                    p.id,
+        index:                 p.index,
+        location:              p.location,
+        czesc:                 p.czesc.trim(),
+        typ:                   p.typ,
+        tryb_naprawy:          p.tryb_naprawy,
+        qualification:         p.qualification,
+        repair_time_h:         p.repair_time_h,
+        parts_cost_pln:        p.parts_cost_pln,
+        is_manual:             p.is_manual,
+        apply_depreciation:    p.apply_depreciation,
+        koszty_naprawy_pln:    c.koszty_naprawy_pln,
+        koszt_amortyzacji_pln: c.koszt_amortyzacji_pln,
+        koszt_netto_pln:       c.koszt_netto_pln,
+        photos:                p.photos,
+      }
+    })
+    const missing = cleanParts.findIndex(p => !p.czesc)
+    if (missing >= 0) {
+      setToast({
+        kind: "err",
+        msg: `Pozycja #${missing + 1}: pole "Część" jest wymagane`,
+      })
+      return
+    }
+    const payload: MacadamData = {
+      vehicle,
+      parts: cleanParts,
+      totals: computeTotals(cleanParts, labourRate, deprPct, materialCost),
+      labour_rate_pln_per_h: labourRate,
+      depreciation_pct:      deprPct,
+      koszt_materialu_pln:   materialCost,
+      // Display overrides — re-derive each tire's status from its tread so the
+      // report colour stays consistent. Sent verbatim; never recomputed.
+      tires_override: tires.map(t => ({ ...t, status: deriveTireStatus(t.tread_mm) })),
+      documents_override: documents,
+    }
+    setSaving(true)
+    try {
+      const res = await fetch(`${API_BASE}/kosztorys-costs/${dealId}`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload),
+      })
+      if (res.status === 401) {
+        sessionStorage.removeItem("admin_token")
+        router.push("/admin")
+        return
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setToast({ kind: "ok", msg: "Zapisano kosztorys" })
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setToast({ kind: "err", msg: `Nie udało się zapisać: ${msg}` })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontFamily: "Inter, system-ui, sans-serif",
+          color: "#6B7280",
+        }}
+      >
+        Ładowanie…
+      </div>
+    )
+  }
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: "#FAFAFA",
+        color: "#1D1D1F",
+        fontFamily: "Inter, system-ui, sans-serif",
+      }}
+    >
+      <div
+        style={{
+          maxWidth: 1100,
+          margin: "0 auto",
+          padding: "32px 24px 120px",
+        }}
+      >
+        {/* Header */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            marginBottom: 24,
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => router.push("/admin/reports")}
+            style={{
+              background: "#fff",
+              border: "1px solid #E8E8ED",
+              borderRadius: 8,
+              padding: "6px 12px",
+              fontSize: 13,
+              cursor: "pointer",
+            }}
+          >
+            ← Lista
+          </button>
+          <div style={{ flex: 1 }}>
+            <div
+              style={{
+                fontSize: 11,
+                color: "#B71C1C",
+                fontWeight: 700,
+                letterSpacing: 1,
+                textTransform: "uppercase",
+              }}
+            >
+              Kosztorys · Zlecenie #{dealId}
+            </div>
+            <h1
+              style={{
+                fontSize: 22,
+                fontWeight: 800,
+                margin: "2px 0 0",
+              }}
+            >
+              Kosztorys ponadnormatywny
+            </h1>
+          </div>
+          <a
+            href={`/kosztorys/${dealId}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              fontSize: 12,
+              color: "#16A34A",
+              border: "1px solid #16A34A",
+              borderRadius: 6,
+              padding: "6px 12px",
+              textDecoration: "none",
+              fontWeight: 600,
+            }}
+          >
+            Otwórz raport ↗
+          </a>
+        </div>
+
+        {/* Order-level cost-engine parameters */}
+        <Section
+          title="Parametry zlecenia"
+          subtitle="Stawka, amortyzacja i koszt materiału — wpływają na wszystkie pozycje"
+        >
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))",
+              gap: 12,
+            }}
+          >
+            <NumberField
+              label="Stawka roboczogodzinowa (PLN/h)"
+              value={labourRate}
+              onChange={setLabourRate}
+            />
+            <NumberField
+              label="Amortyzacja (%)"
+              value={deprPct}
+              onChange={setDeprPct}
+            />
+            {/* Locked per client request — value still loaded from json
+                .koszt_materialu_pln, flows through computeTotals, and is
+                sent back in the PUT payload. Only the edit affordance is
+                gone. */}
+            <ComputedField
+              label="Koszt materiału i części drobnych (PLN)"
+              value={materialCost ?? 0}
+            />
+            <ComputedField
+              label="Razem netto części (uszkodzenia)"
+              value={partsNetto}
+            />
+          </div>
+        </Section>
+
+        {/* Vehicle (read-only) */}
+        <Section title="Pojazd" subtitle="Prefill z inspekcji — tylko podgląd">
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+              gap: 10,
+            }}
+          >
+            <ReadOnlyRow label="Marka/Model" value={vehicle.make_model} />
+            <ReadOnlyRow label="VIN" value={vehicle.vin} mono />
+            <ReadOnlyRow
+              label="Rejestracja"
+              value={vehicle.registration_plate}
+            />
+            <ReadOnlyRow
+              label="Przebieg"
+              value={
+                vehicle.mileage_km !== null
+                  ? `${vehicle.mileage_km} km`
+                  : ""
+              }
+            />
+            <ReadOnlyRow
+              label="Pierwsza rejestracja"
+              value={vehicle.first_registration}
+            />
+            <ReadOnlyRow label="Kolor" value={vehicle.body_colour} />
+            <ReadOnlyRow label="Klient" value={vehicle.klient} />
+            <ReadOnlyRow
+              label="Data inspekcji"
+              value={vehicle.inspection_date}
+            />
+          </div>
+        </Section>
+
+        {/* Parts */}
+        <Section
+          title="Wybrane pozycje"
+          subtitle={`${parts.length} ${
+            parts.length === 1 ? "pozycja" : "pozycji"
+          } — koszty obliczane automatycznie`}
+        >
+          {parts.length === 0 ? (
+            <div style={{ color: "#86868B", fontSize: 13 }}>
+              Brak pozycji. Dodaj z listy dostępnych uszkodzeń poniżej lub ręcznie.
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              {parts.map(p => (
+                <PartEditor
+                  key={p.id}
+                  part={p}
+                  labourRate={labourRate}
+                  deprPct={deprPct}
+                  onChange={patch => updatePart(p.id, patch)}
+                  onRemove={() => removePart(p.id)}
+                  onRemovePhoto={i => removePhotoFromPart(p.id, i)}
+                  onAddPhoto={uri => addPhotoToPart(p.id, uri)}
+                />
+              ))}
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={onAddManual}
+            style={{
+              marginTop: 14,
+              background: "#fff",
+              border: "1px dashed #B71C1C",
+              color: "#B71C1C",
+              borderRadius: 8,
+              padding: "8px 14px",
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            + Dodaj pozycję ręcznie
+          </button>
+        </Section>
+
+        {/* Available damages */}
+        <Section
+          title="Dostępne uszkodzenia (z inspekcji)"
+          subtitle="Kliknij „Dodaj”, aby utworzyć pozycję ze zdjęciami"
+        >
+          {available.length === 0 ? (
+            <div style={{ color: "#86868B", fontSize: 13 }}>
+              Brak uszkodzeń w danych inspekcji.
+            </div>
+          ) : (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+                gap: 10,
+              }}
+            >
+              {available.map((d, i) => {
+                const k = `${d.source}-${d.index ?? ""}`
+                const isUsed = usedDamageKeys.has(k)
+                return (
+                  <div
+                    key={`${k}-${i}`}
+                    style={{
+                      border: "1px solid #E8E8ED",
+                      background: isUsed ? "#F5F5F7" : "#fff",
+                      borderRadius: 10,
+                      padding: 12,
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 8,
+                    }}
+                  >
+                    <div
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 700,
+                        color: d.source === "int" ? "#0369A1" : "#B71C1C",
+                        textTransform: "uppercase",
+                        letterSpacing: 1,
+                      }}
+                    >
+                      {d.source === "int" ? "Wnętrze" : "Zewnątrz"} · #
+                      {d.index ?? "?"}
+                    </div>
+                    <div style={{ fontWeight: 700, fontSize: 13 }}>
+                      {d.location || "(brak nazwy)"}
+                    </div>
+                    <div style={{ fontSize: 12, color: "#6B7280" }}>
+                      {d.type}
+                      {d.size ? ` · ${d.size}` : ""}
+                    </div>
+                    {d.photo_urls.length > 0 && (
+                      <div
+                        style={{
+                          fontSize: 11,
+                          color: "#86868B",
+                        }}
+                      >
+                        {d.photo_urls.length}{" "}
+                        {d.photo_urls.length === 1 ? "zdjęcie" : "zdjęć"}
+                      </div>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => onAddDamage(d)}
+                      disabled={isUsed}
+                      style={{
+                        marginTop: "auto",
+                        background: isUsed ? "#F5F5F7" : "#FEF2F2",
+                        border: `1px solid ${
+                          isUsed ? "#E8E8ED" : "rgba(183,28,28,0.3)"
+                        }`,
+                        color: isUsed ? "#AEAEB2" : "#B71C1C",
+                        borderRadius: 6,
+                        padding: "6px 12px",
+                        fontSize: 12,
+                        fontWeight: 600,
+                        cursor: isUsed ? "not-allowed" : "pointer",
+                      }}
+                    >
+                      {isUsed ? "Dodane" : "Dodaj"}
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </Section>
+
+        {/* Tires override — display-only, overrides inspection on the report */}
+        <Section
+          title="Opony"
+          subtitle="Edytowane wartości nadpisują dane z inspekcji na raporcie kosztorysu"
+        >
+          {tires.length === 0 ? (
+            <div style={{ color: "#86868B", fontSize: 13 }}>
+              Brak danych o oponach w inspekcji.
+            </div>
+          ) : (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+                gap: 12,
+              }}
+            >
+              {tires.map((t, i) => (
+                <div
+                  key={t.code || t.position || i}
+                  style={{
+                    border: "1px solid #E8E8ED",
+                    borderRadius: 10,
+                    padding: 12,
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 10,
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 700,
+                      color: "#1D1D1F",
+                      textTransform: "uppercase",
+                      letterSpacing: 0.6,
+                    }}
+                  >
+                    {t.position || t.code || `Koło ${i + 1}`}
+                  </div>
+                  <Field
+                    label="Marka"
+                    value={t.brand ?? ""}
+                    onChange={v => updateTire(i, { brand: v })}
+                  />
+                  <Field
+                    label="Model"
+                    value={t.model ?? ""}
+                    onChange={v => updateTire(i, { model: v })}
+                  />
+                  <Field
+                    label="Rozmiar"
+                    value={t.size ?? ""}
+                    onChange={v => updateTire(i, { size: v })}
+                  />
+                  <NumberField
+                    label="Bieżnik (mm)"
+                    value={t.tread_mm ?? null}
+                    onChange={n => updateTire(i, { tread_mm: n })}
+                  />
+                  <EnumField
+                    label="Sezon"
+                    value={t.type ?? ""}
+                    options={SEASON_OPTIONS}
+                    onChange={v => updateTire(i, { type: v || null })}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+        </Section>
+
+        {/* Documents checklist override — display-only */}
+        <Section
+          title="Wykaz dokumentów"
+          subtitle="Status nadpisuje dane z inspekcji na raporcie kosztorysu"
+        >
+          {documents.length === 0 ? (
+            <div style={{ color: "#86868B", fontSize: 13 }}>
+              Brak wykazu dokumentów w inspekcji.
+            </div>
+          ) : (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+                gap: 10,
+              }}
+            >
+              {documents.map((d, i) => (
+                <div
+                  key={`${d.name}-${i}`}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    border: "1px solid #E8E8ED",
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                  }}
+                >
+                  <span
+                    style={{
+                      flex: 1,
+                      fontSize: 13,
+                      color: "#1D1D1F",
+                      overflowWrap: "anywhere",
+                    }}
+                  >
+                    {d.name}
+                  </span>
+                  <select
+                    value={d.status}
+                    onChange={e => updateDocStatus(i, e.target.value)}
+                    style={{
+                      background: "#fff",
+                      border: "1px solid #E8E8ED",
+                      borderRadius: 6,
+                      padding: "6px 8px",
+                      fontSize: 13,
+                      flexShrink: 0,
+                    }}
+                  >
+                    {/* Keep the current value selectable even if non-standard */}
+                    {!DOC_STATUS_OPTIONS.includes(d.status) && d.status && (
+                      <option value={d.status}>{d.status}</option>
+                    )}
+                    {DOC_STATUS_OPTIONS.map(s => (
+                      <option key={s} value={s}>
+                        {s}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ))}
+            </div>
+          )}
+        </Section>
+      </div>
+
+      {/* Sticky save bar */}
+      <div
+        style={{
+          position: "fixed",
+          bottom: 0,
+          left: 0,
+          right: 0,
+          background: "#fff",
+          borderTop: "1px solid #E8E8ED",
+          boxShadow: "0 -4px 12px rgba(0,0,0,0.05)",
+        }}
+      >
+        <div
+          style={{
+            maxWidth: 1100,
+            margin: "0 auto",
+            padding: "14px 24px",
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            justifyContent: "space-between",
+          }}
+        >
+          <div style={{ fontSize: 13, color: "#6B7280", display: "flex", gap: 18, flexWrap: "wrap" }}>
+            <span>{parts.length} pozycji</span>
+            <span>
+              netto{" "}
+              <strong style={{ color: "#16A34A" }}>
+                {computeTotals(parts, labourRate, deprPct, materialCost).netto_pln.toLocaleString("pl-PL", {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}{" "}
+                PLN
+              </strong>
+            </span>
+            <span>
+              brutto{" "}
+              <strong style={{ color: "#1D1D1F" }}>
+                {computeTotals(parts, labourRate, deprPct, materialCost).gross_pln.toLocaleString("pl-PL", {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}{" "}
+                PLN
+              </strong>
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={onSave}
+            disabled={saving}
+            style={{
+              background: saving ? "#F5F5F7" : "#B71C1C",
+              color: saving ? "#AEAEB2" : "#fff",
+              border: "none",
+              borderRadius: 8,
+              padding: "10px 18px",
+              fontSize: 14,
+              fontWeight: 700,
+              cursor: saving ? "not-allowed" : "pointer",
+            }}
+          >
+            {saving ? "Zapisywanie…" : "Zapisz"}
+          </button>
+        </div>
+      </div>
+
+      {toast && (
+        <div
+          role="alert"
+          style={{
+            position: "fixed",
+            top: 16,
+            right: 16,
+            zIndex: 100,
+            background: toast.kind === "ok" ? "#ECFDF5" : "#FEF2F2",
+            border: `1px solid ${
+              toast.kind === "ok" ? "#A7F3D0" : "#FECACA"
+            }`,
+            color: toast.kind === "ok" ? "#047857" : "#B91C1C",
+            padding: "10px 14px",
+            borderRadius: 8,
+            fontSize: 13,
+            fontWeight: 600,
+            maxWidth: 380,
+            boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+          }}
+        >
+          <span style={{ flex: 1 }}>{toast.msg}</span>
+          <button
+            type="button"
+            onClick={() => setToast(null)}
+            aria-label="Zamknij"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "inherit",
+              fontWeight: 700,
+              cursor: "pointer",
+              fontSize: 16,
+              lineHeight: 1,
+            }}
+          >
+            ×
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Sub-components ──────────────────────────────────────────────────────────
+
+function Section({
+  title,
+  subtitle,
+  children,
+}: {
+  title: string
+  subtitle?: string
+  children: React.ReactNode
+}) {
+  return (
+    <section
+      style={{
+        background: "#fff",
+        border: "1px solid #E8E8ED",
+        borderRadius: 12,
+        padding: 20,
+        boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+        marginBottom: 20,
+      }}
+    >
+      <div style={{ marginBottom: 14 }}>
+        <div
+          style={{
+            fontSize: 16,
+            fontWeight: 700,
+          }}
+        >
+          {title}
+        </div>
+        {subtitle && (
+          <div style={{ fontSize: 12, color: "#86868B", marginTop: 2 }}>
+            {subtitle}
+          </div>
+        )}
+      </div>
+      {children}
+    </section>
+  )
+}
+
+function ReadOnlyRow({
+  label,
+  value,
+  mono,
+}: {
+  label: string
+  value: string
+  mono?: boolean
+}) {
+  return (
+    <div
+      style={{
+        background: "#F9FAFB",
+        border: "1px solid #F3F4F6",
+        borderRadius: 8,
+        padding: "8px 12px",
+      }}
+    >
+      <div
+        style={{
+          fontSize: 10,
+          color: "#86868B",
+          fontWeight: 600,
+          letterSpacing: 0.4,
+          textTransform: "uppercase",
+        }}
+      >
+        {label}
+      </div>
+      <div
+        style={{
+          fontSize: 13,
+          color: "#1D1D1F",
+          fontFamily: mono
+            ? "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            : undefined,
+          overflowWrap: "anywhere",
+        }}
+      >
+        {value || "—"}
+      </div>
+    </div>
+  )
+}
+
+function PartEditor({
+  part,
+  labourRate,
+  deprPct,
+  onChange,
+  onRemove,
+  onRemovePhoto,
+  onAddPhoto,
+}: {
+  part: MacadamPart
+  labourRate: number | null
+  deprPct: number | null
+  onChange: (patch: Partial<MacadamPart>) => void
+  onRemove: () => void
+  onRemovePhoto: (idx: number) => void
+  onAddPhoto: (dataUri: string) => void
+}) {
+  const computed = computePartCosts(part, labourRate, deprPct)
+  const showPartsCost = part.is_manual || part.qualification === "wymiana"
+  const partsCostLabel = part.is_manual ? "Koszt (PLN)" : "Koszt części (PLN)"
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const onPickPhotos = (e: ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files
+    if (files && files.length > 0) {
+      Array.from(files).forEach(file => {
+        const reader = new FileReader()
+        reader.onload = async () => {
+          const raw = typeof reader.result === "string" ? reader.result : ""
+          if (!raw) return
+          onAddPhoto(await compressImageDataUrl(raw))
+        }
+        reader.readAsDataURL(file)
+      })
+    }
+    // reset so picking the same file again still fires onChange
+    e.target.value = ""
+  }
+  return (
+    <div
+      style={{
+        border: "1px solid #E8E8ED",
+        borderRadius: 10,
+        padding: 14,
+        background: "#FAFBFC",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          marginBottom: 10,
+        }}
+      >
+        <div
+          style={{
+            background: "#1D1D1F",
+            color: "#fff",
+            borderRadius: 6,
+            padding: "3px 8px",
+            fontSize: 12,
+            fontWeight: 700,
+            minWidth: 28,
+            textAlign: "center",
+          }}
+        >
+          {part.index}
+        </div>
+        <select
+          value={part.location}
+          onChange={e =>
+            onChange({
+              location:
+                e.target.value === "interior" ? "interior" : "exterior",
+            })
+          }
+          style={{
+            background: "#fff",
+            border: "1px solid #E8E8ED",
+            borderRadius: 6,
+            padding: "4px 8px",
+            fontSize: 12,
+          }}
+        >
+          <option value="exterior">Zewnątrz</option>
+          <option value="interior">Wnętrze</option>
+        </select>
+        {part.is_manual && (
+          <span
+            style={{
+              background: "#EEF2FF",
+              color: "#3730A3",
+              borderRadius: 6,
+              padding: "3px 8px",
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: 0.4,
+              textTransform: "uppercase",
+            }}
+          >
+            Ręczna
+          </span>
+        )}
+        <div style={{ flex: 1 }} />
+        <button
+          type="button"
+          onClick={onRemove}
+          style={{
+            background: "transparent",
+            border: "1px solid #B71C1C",
+            color: "#B71C1C",
+            borderRadius: 6,
+            padding: "4px 10px",
+            fontSize: 12,
+            fontWeight: 600,
+            cursor: "pointer",
+          }}
+        >
+          Usuń
+        </button>
+      </div>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+          gap: 10,
+        }}
+      >
+        <Field
+          label="Część *"
+          value={part.czesc}
+          onChange={v => onChange({ czesc: v })}
+          required
+        />
+        <Field
+          label="Typ uszkodzenia"
+          value={part.typ}
+          onChange={v => onChange({ typ: v })}
+        />
+        <Field
+          label="Tryb naprawy"
+          value={part.tryb_naprawy}
+          onChange={v => onChange({ tryb_naprawy: v })}
+        />
+        {!part.is_manual && (
+          <EnumField
+            label="Kwalifikacja"
+            value={part.qualification}
+            options={QUAL_OPTIONS}
+            onChange={v => onChange({ qualification: v })}
+          />
+        )}
+        {!part.is_manual && (
+          <NumberField
+            label="Czas naprawy (h)"
+            value={part.repair_time_h}
+            onChange={n => onChange({ repair_time_h: n })}
+            disabled={part.qualification === "akceptowalne"}
+          />
+        )}
+        {showPartsCost && (
+          <NumberField
+            label={partsCostLabel}
+            value={part.parts_cost_pln}
+            onChange={n => onChange({ parts_cost_pln: n })}
+          />
+        )}
+        {part.qualification !== "akceptowalne" && (
+          <label
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 4,
+              justifyContent: "flex-start",
+            }}
+          >
+            <span
+              style={{
+                fontSize: 10,
+                color: "#86868B",
+                fontWeight: 600,
+                letterSpacing: 0.4,
+                textTransform: "uppercase",
+              }}
+            >
+              Amortyzacja
+            </span>
+            <span
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                background: "#fff",
+                border: "1px solid #E8E8ED",
+                borderRadius: 6,
+                padding: "8px 10px",
+                fontSize: 13,
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={part.apply_depreciation !== false}
+                onChange={e => onChange({ apply_depreciation: e.target.checked })}
+                style={{ width: 16, height: 16, cursor: "pointer" }}
+              />
+              Uwzględnij amortyzację
+            </span>
+          </label>
+        )}
+        <ComputedField label="Koszty naprawy (PLN)" value={computed.koszty_naprawy_pln} />
+        <ComputedField label="Amortyzacja (PLN)"   value={computed.koszt_amortyzacji_pln} />
+        <ComputedField label="Netto (PLN)"          value={computed.koszt_netto_pln} accent />
+      </div>
+
+      <div style={{ marginTop: 12 }}>
+          <div
+            style={{
+              fontSize: 11,
+              color: "#86868B",
+              fontWeight: 600,
+              letterSpacing: 0.5,
+              textTransform: "uppercase",
+              marginBottom: 6,
+            }}
+          >
+            Zdjęcia ({part.photos.length})
+          </div>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(110px, 1fr))",
+              gap: 8,
+            }}
+          >
+            {part.photos.map((url, i) => (
+              <div
+                key={`${url}-${i}`}
+                style={{
+                  position: "relative",
+                  aspectRatio: "4 / 3",
+                  borderRadius: 6,
+                  overflow: "hidden",
+                  border: "1px solid #E8E8ED",
+                  background: "#F5F5F7",
+                }}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={url}
+                  alt=""
+                  loading="lazy"
+                  style={{
+                    width: "100%",
+                    height: "100%",
+                    objectFit: "cover",
+                    display: "block",
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => onRemovePhoto(i)}
+                  aria-label="Usuń zdjęcie"
+                  style={{
+                    position: "absolute",
+                    top: 4,
+                    right: 4,
+                    width: 24,
+                    height: 24,
+                    borderRadius: 12,
+                    background: "rgba(0,0,0,0.65)",
+                    color: "#fff",
+                    border: "none",
+                    cursor: "pointer",
+                    fontSize: 14,
+                    lineHeight: 1,
+                    fontWeight: 700,
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+            {/* Add-photo tile — opens the hidden file input. Admin-added photos
+                are appended as data-URI strings, indistinguishable in the grid
+                from report-pulled ones and removable with the same × button. */}
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              aria-label="Dodaj zdjęcie"
+              style={{
+                aspectRatio: "4 / 3",
+                borderRadius: 6,
+                border: "1px dashed #C7C7CC",
+                background: "#FAFAFC",
+                color: "#0071E3",
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                textAlign: "center",
+                padding: 8,
+              }}
+            >
+              + Dodaj zdjęcie
+            </button>
+          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            onChange={onPickPhotos}
+            style={{ display: "none" }}
+          />
+        </div>
+    </div>
+  )
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+  required,
+}: {
+  label: string
+  value: string
+  onChange: (v: string) => void
+  required?: boolean
+}) {
+  return (
+    <label
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+      }}
+    >
+      <span
+        style={{
+          fontSize: 10,
+          color: "#86868B",
+          fontWeight: 600,
+          letterSpacing: 0.4,
+          textTransform: "uppercase",
+        }}
+      >
+        {label}
+      </span>
+      <input
+        type="text"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        required={required}
+        style={{
+          background: "#fff",
+          border: "1px solid #E8E8ED",
+          borderRadius: 6,
+          padding: "8px 10px",
+          fontSize: 13,
+          width: "100%",
+        }}
+      />
+    </label>
+  )
+}
+
+function EnumField<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string
+  value: T
+  options: { value: T; label: string }[]
+  onChange: (v: T) => void
+}) {
+  return (
+    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <span
+        style={{
+          fontSize: 10,
+          color: "#86868B",
+          fontWeight: 600,
+          letterSpacing: 0.4,
+          textTransform: "uppercase",
+        }}
+      >
+        {label}
+      </span>
+      <select
+        value={value}
+        onChange={e => onChange(e.target.value as T)}
+        style={{
+          background: "#fff",
+          border: "1px solid #E8E8ED",
+          borderRadius: 6,
+          padding: "8px 10px",
+          fontSize: 13,
+          width: "100%",
+        }}
+      >
+        {options.map(opt => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  )
+}
+
+function ComputedField({
+  label,
+  value,
+  accent,
+}: {
+  label: string
+  value: number
+  accent?: boolean
+}) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <span
+        style={{
+          fontSize: 10,
+          color: "#86868B",
+          fontWeight: 600,
+          letterSpacing: 0.4,
+          textTransform: "uppercase",
+        }}
+      >
+        {label}
+      </span>
+      <div
+        style={{
+          background: accent ? "#ECFDF5" : "#F9FAFB",
+          border: `1px solid ${accent ? "#A7F3D0" : "#F3F4F6"}`,
+          borderRadius: 6,
+          padding: "8px 10px",
+          fontSize: 13,
+          fontWeight: 700,
+          color: accent ? "#047857" : "#1D1D1F",
+          fontFamily:
+            "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+        }}
+      >
+        {value.toLocaleString("pl-PL", {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        })}
+      </div>
+    </div>
+  )
+}
+
+function NumberField({
+  label,
+  value,
+  onChange,
+  disabled,
+}: {
+  label: string
+  value: number | null
+  onChange: (n: number | null) => void
+  disabled?: boolean
+}) {
+  const [draft, setDraft] = useState<string>(
+    value === null || value === undefined
+      ? ""
+      : String(value)
+  )
+
+  useEffect(() => {
+    setDraft(value === null || value === undefined ? "" : String(value))
+  }, [value])
+
+  return (
+    <label
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+      }}
+    >
+      <span
+        style={{
+          fontSize: 10,
+          color: "#86868B",
+          fontWeight: 600,
+          letterSpacing: 0.4,
+          textTransform: "uppercase",
+        }}
+      >
+        {label}
+      </span>
+      <input
+        type="text"
+        inputMode="decimal"
+        value={draft}
+        placeholder="—"
+        disabled={disabled}
+        onChange={e => {
+          const v = e.target.value
+          setDraft(v)
+          onChange(parseNumberOrNull(v))
+        }}
+        style={{
+          background: disabled ? "#F5F5F7" : "#fff",
+          border: "1px solid #E8E8ED",
+          borderRadius: 6,
+          padding: "8px 10px",
+          fontSize: 13,
+          fontFamily:
+            "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+          width: "100%",
+          color: disabled ? "#AEAEB2" : undefined,
+          cursor: disabled ? "not-allowed" : undefined,
+        }}
+      />
+    </label>
+  )
+}
