@@ -1,0 +1,163 @@
+"""
+Inspector Model
+================
+SQLAlchemy model for the inspectors table.
+"""
+
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, UniqueConstraint, LargeBinary, Text, Index
+from sqlalchemy.sql import func
+from database import Base
+
+
+class Inspector(Base):
+    __tablename__ = "inspectors"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    phone = Column(String(20), unique=True, nullable=False, index=True)
+    pin_hash = Column(String(255), nullable=False)
+    email = Column(String(100), nullable=True)
+    is_active = Column(Boolean, default=True)
+    bitrix_list_id = Column(String(20), nullable=True)  # Bitrix list item ID for UF_CRM_1773970466449
+    created_at = Column(DateTime, server_default=func.now())
+
+    def __repr__(self):
+        return f"<Inspector(id={self.id}, name='{self.name}', phone='{self.phone}')>"
+
+
+class InspectorNotification(Base):
+    """Tracks which deals have been notified to which inspector — prevents duplicate emails."""
+    __tablename__ = "inspector_notifications"
+
+    id = Column(Integer, primary_key=True)
+    deal_id = Column(String(20), nullable=False)
+    phone = Column(String(20), nullable=False)
+    sent_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('deal_id', 'phone', name='unique_deal_phone'),
+    )
+
+    def __repr__(self):
+        return f"<InspectorNotification(deal_id='{self.deal_id}', phone='{self.phone}')>"
+
+
+class InspectionPDF(Base):
+    """Stores the generated PDF for each submitted inspection."""
+    __tablename__ = "inspection_pdfs"
+
+    id = Column(Integer, primary_key=True)
+    deal_id = Column(Integer, unique=True, nullable=False, index=True)
+    pdf_bytes = Column(LargeBinary, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class InspectionPhoto(Base):
+    """Stores uploaded inspection photos by deal and slot ID."""
+    __tablename__ = "inspection_photos"
+
+    id = Column(Integer, primary_key=True, index=True)
+    deal_id = Column(Integer, nullable=False, index=True)
+    slot_id = Column(String(80), nullable=False)   # e.g. "photo_front", "video_engine"
+    photo_bytes = Column(LargeBinary, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class SubmissionJob(Base):
+    """Tracks async background submission status for each inspection deal."""
+    __tablename__ = "submission_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    deal_id = Column(Integer, unique=True, nullable=False, index=True)
+    # pending | processing | done | error
+    status = Column(String(20), nullable=False, default='pending')
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now())
+
+
+class ValuationDelivery(Base):
+    """One row per deal whose valuation documents were mailed to the client.
+
+    Written by webhook.send_valuation_to_client when a deal enters the
+    "Wyslij wycene klientowi" stage. The UNIQUE deal_id doubles as the
+    idempotency key: a row with status='sent' means the client already got
+    the email, so re-firing webhooks never re-sends. Non-'sent' rows
+    (skipped_no_email / skipped_no_documents / error) are retried on the
+    next webhook, since those are recoverable once the data is filled in.
+    """
+    __tablename__ = "valuation_deliveries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    deal_id = Column(Integer, unique=True, nullable=False, index=True)
+    # sent | skipped_no_email | skipped_no_documents | error
+    status = Column(String(30), nullable=False)
+    recipient = Column(String(255), nullable=True)
+    sent_at = Column(DateTime, server_default=func.now())
+    error = Column(Text, nullable=True)
+    # Unguessable public key for the customer documents page
+    # (/dokumenty/{token}). Generated once per deal and reused on every later
+    # send, so a re-sent email keeps working with the same link.
+    token = Column(String(64), unique=True, nullable=True, index=True)
+
+
+class InspectionRecord(Base):
+    """Stores the full inspection payload at submit time for the report endpoint.
+
+    Most PWA step data (equipment, damages, notes) is NOT mapped to individual
+    Bitrix24 fields, so it cannot be read back from Bitrix.  This table is the
+    authoritative DB-side source for the web report page.
+    """
+    __tablename__ = "inspection_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    deal_id = Column(Integer, unique=True, nullable=False, index=True)
+    # JSON columns — each stores the corresponding step payload
+    equipment_json      = Column(Text, nullable=True)   # equipmentCompleteness
+    full_equipment_json = Column(Text, nullable=True)   # fullEquipment
+    exterior_damage_json= Column(Text, nullable=True)   # exteriorDamage array
+    interior_damage_json= Column(Text, nullable=True)   # interiorDamage array
+    notes_json          = Column(Text, nullable=True)   # notesValuation
+    vehicle_json        = Column(Text, nullable=True)   # vehicleData
+    tires_json          = Column(Text, nullable=True)   # tires
+    mechanical_json     = Column(Text, nullable=True)   # mechanical
+    paint_json          = Column(Text, nullable=True)   # paintMeasurement (19 panels)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now())
+
+
+class InspectionEdit(Base):
+    """Audit log for admin edits to Condition Report fields."""
+    __tablename__ = "inspection_edits"
+
+    id = Column(Integer, primary_key=True, index=True)
+    deal_id = Column(Integer, nullable=False, index=True)
+    admin_username = Column(String(100), nullable=False)
+    edited_at = Column(DateTime, server_default=func.now())
+    field_path = Column(String(255), nullable=False)
+    old_value = Column(Text, nullable=True)   # JSON-serialised
+    new_value = Column(Text, nullable=True)   # JSON-serialised
+
+    __table_args__ = (
+        Index("ix_inspection_edits_deal_edited", "deal_id", "edited_at"),
+    )
+
+
+class KosztorysCost(Base):
+    """Stores the saved above-norm damage cost entries for a deal.
+    data_json is a serialised payload matching the MacadamData wire shape
+    in types/kosztorysMacadam.ts (parts[] with czesc / typ / tryb_naprawy
+    / koszty_naprawy_pln / koszt_amortyzacji_pln / koszt_netto_pln /
+    photos). One row per deal — admin edits in-place via
+    PUT /api/kosztorys-costs/{deal_id}.
+
+    Renamed from MacadamReport / macadam_reports — the previous table
+    was empty so create_all builds the new one cleanly on startup; the
+    old empty table is left in place (no destructive migration).
+    """
+    __tablename__ = "kosztorys_costs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    deal_id = Column(Integer, unique=True, nullable=False, index=True)
+    data_json = Column(Text, nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
