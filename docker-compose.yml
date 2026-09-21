@@ -1,0 +1,81 @@
+services:
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      # ⚠️  NEVER change these three values once the volume is created.
+      # Changing them causes auth failure on restart because postgres bakes
+      # the password into the volume on first init and never re-reads it.
+      # Use safe_deploy.sh / safe_restart alias — never `docker-compose down -v`.
+      POSTGRES_USER: inspection_user
+      POSTGRES_PASSWORD: inspection_pass
+      POSTGRES_DB: inspection_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inspection_user -d inspection_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      BITRIX_WEBHOOK_URL: ${BITRIX_WEBHOOK_URL}
+      BITRIX_STORAGE_ID: ${BITRIX_STORAGE_ID:-1}
+      BITRIX_APP_ID: ${BITRIX_APP_ID:-}
+      BITRIX_APP_SECRET: ${BITRIX_APP_SECRET:-}
+      SECRET_KEY: ${SECRET_KEY:-supersecretkey123}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin2025!}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://inspection_user:inspection_pass@db:5432/inspection_db}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_FROM: ${SMTP_FROM}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-"Auto Inspection"}
+      ENABLE_MOCK_LOGIN: ${ENABLE_MOCK_LOGIN:-false}
+    volumes:
+      - backend_data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://backend:8000}
+        NEXT_PUBLIC_DEMO_MODE: ${NEXT_PUBLIC_DEMO_MODE:-false}
+        NEXT_PUBLIC_ENABLE_MOCK_LOGIN: ${NEXT_PUBLIC_ENABLE_MOCK_LOGIN:-false}
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://backend:8000}
+      NEXT_PUBLIC_DEMO_MODE: ${NEXT_PUBLIC_DEMO_MODE:-false}
+      NEXT_PUBLIC_ENABLE_MOCK_LOGIN: ${NEXT_PUBLIC_ENABLE_MOCK_LOGIN:-false}
+      # Server-only: proxy route uses this to reach backend directly via Docker network,
+      # bypassing any Nginx that would strip the /api prefix and cause 404s.
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+
+volumes:
+  backend_data:
+  postgres_data:
